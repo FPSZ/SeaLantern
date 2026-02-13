@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::fs;
+use regex::Regex;
+
+#[cfg(target_os = "windows")]
+use winreg::enums::*;
+#[cfg(target_os = "windows")]
+use winreg::RegKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaInfo {
@@ -12,7 +20,14 @@ pub struct JavaInfo {
 
 pub fn detect_java_installations() -> Vec<JavaInfo> {
     let mut results = Vec::new();
-    let candidate_paths = get_candidate_paths();
+    let mut candidate_paths = get_candidate_paths();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(reg_paths) = get_javas_from_registry() {
+            candidate_paths.extend(reg_paths);
+        }
+    }
 
     for path in candidate_paths {
         if let Some(info) = check_java(&path) {
@@ -22,353 +37,194 @@ pub fn detect_java_installations() -> Vec<JavaInfo> {
         }
     }
 
-    // Sort: highest version first
     results.sort_by(|a, b| b.major_version.cmp(&a.major_version));
-
     results
+}
+
+pub fn validate_java(path: &str) -> Result<JavaInfo, String> {
+    check_java(path).ok_or_else(|| format!("无法验证 Java 路径: {}", path))
 }
 
 fn get_candidate_paths() -> Vec<String> {
     let mut paths = Vec::new();
 
-    // 1. java in system PATH
     paths.push("java".to_string());
 
-    // 2. JAVA_HOME
-    if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        push_java_exe(&java_home, &mut paths);
+    for env_var in &["JAVA_HOME", "JDK_HOME", "GRAALVM_HOME"] {
+        if let Ok(val) = std::env::var(env_var) {
+            push_java_exe(&val, &mut paths);
+        }
     }
 
     #[cfg(target_os = "windows")]
     {
-        // 3. Scan ALL drive letters
-        for letter in b'A'..=b'Z' {
-            let drive = format!("{}:\\", letter as char);
-            if !std::path::Path::new(&drive).exists() {
-                continue;
-            }
-
-            // Standard install locations
-            let base_dirs = vec![
-                format!("{}Program Files\\Java", drive),
-                format!("{}Program Files (x86)\\Java", drive),
-                format!("{}Program Files\\Eclipse Adoptium", drive),
-                format!("{}Program Files\\AdoptOpenJDK", drive),
-                format!("{}Program Files\\Zulu", drive),
-                format!("{}Program Files\\BellSoft", drive),
-                format!("{}Program Files\\Amazon Corretto", drive),
-                format!("{}Program Files\\Microsoft", drive),
-                format!("{}Program Files\\Common Files\\Oracle\\Java\\javapath", drive),
-                format!("{}Program Files\\GraalVM", drive),
-            ];
-
-            for dir in &base_dirs {
-                deep_scan_java_dir(dir, &mut paths, 2);
-            }
-
-            // Custom locations people commonly use
-            let custom_roots = vec![
-                format!("{}Java", drive),
-                format!("{}java", drive),
-                format!("{}jdk", drive),
-                format!("{}jre", drive),
-            ];
-
-            for dir in &custom_roots {
-                deep_scan_java_dir(dir, &mut paths, 3);
-            }
-
-            // Game-related Java installations (like Minecraft bundled Java)
-            let game_dirs = vec![
-                format!("{}Game", drive),
-                format!("{}Games", drive),
-                format!("{}game", drive),
-                format!("{}games", drive),
-            ];
-
-            for dir in &game_dirs {
-                scan_for_java_recursive(dir, &mut paths, 4);
+        let mut scan_roots = Vec::new();
+        
+        for drive_letter in b'C'..=b'E' {
+            let drive = format!("{}:\\", drive_letter as char);
+            if Path::new(&drive).exists() {
+                scan_roots.push(PathBuf::from(&drive).join("Program Files").join("Java"));
+                scan_roots.push(PathBuf::from(&drive).join("Program Files").join("Zulu"));
+                scan_roots.push(PathBuf::from(&drive).join("Program Files").join("Eclipse Adoptium"));
+                scan_roots.push(PathBuf::from(&drive).join("Program Files").join("BellSoft"));
             }
         }
 
-        // 4. User profile locations
-        if let Ok(user) = std::env::var("USERPROFILE") {
-            let user_dirs = vec![
-                // .minecraft bundled runtimes (like PCL detects)
-                format!("{}\\AppData\\Roaming\\.minecraft\\runtime", user),
-                // Scoop
-                format!("{}\\scoop\\apps", user),
-                // IntelliJ / Android Studio bundled JDKs
-                format!("{}\\.jdks", user),
-                // Gradle
-                format!("{}\\.gradle\\jdks", user),
-                // sdkman
-                format!("{}\\.sdkman\\candidates\\java", user),
-                // Local programs
-                format!("{}\\AppData\\Local\\Programs", user),
-            ];
-
-            for dir in &user_dirs {
-                deep_scan_java_dir(dir, &mut paths, 4);
-            }
-        }
-
-        // 5. APPDATA locations
         if let Ok(appdata) = std::env::var("APPDATA") {
-            // .minecraft runtime
-            let mc_runtime = format!("{}\\..\\Roaming\\.minecraft\\runtime", appdata);
-            deep_scan_java_dir(&mc_runtime, &mut paths, 4);
-            let mc_runtime2 = format!("{}\\.minecraft\\runtime", appdata);
-            deep_scan_java_dir(&mc_runtime2, &mut paths, 4);
+            scan_roots.push(PathBuf::from(&appdata).join(".minecraft").join("runtime"));
+            scan_roots.push(PathBuf::from(&appdata).join(".minecraft").join("cache").join("java"));
+        }
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            scan_roots.push(PathBuf::from(&local_appdata).join("Programs").join("Adoptium"));
         }
 
-        // 6. Try Windows Registry via `where` command
+        for root in scan_roots {
+            deep_scan_recursive(&root, &mut paths, 5);
+        }
+
         if let Ok(output) = Command::new("where").arg("java").output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    paths.push(trimmed.to_string());
-                }
+                paths.push(line.trim().to_string());
             }
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        paths.push("/usr/bin/java".to_string());
-        paths.push("/usr/local/bin/java".to_string());
-
-        let jvm_dirs = vec![
-            "/usr/lib/jvm",
-            "/usr/local/lib/jvm",
-            "/Library/Java/JavaVirtualMachines",
-        ];
-
-        for dir in jvm_dirs {
-            deep_scan_java_dir(dir, &mut paths, 3);
-        }
-
-        if let Ok(home) = std::env::var("HOME") {
-            let home_dirs = vec![
-                format!("{}/.jdks", home),
-                format!("{}/.sdkman/candidates/java", home),
-                format!("{}/.gradle/jdks", home),
-            ];
-            for dir in &home_dirs {
-                deep_scan_java_dir(dir, &mut paths, 3);
-            }
+        let common_dirs = vec!["/usr/lib/jvm", "/usr/local/lib/jvm", "/Library/Java/JavaVirtualMachines"];
+        for dir in common_dirs {
+            deep_scan_recursive(Path::new(dir), &mut paths, 4);
         }
     }
 
     paths
 }
 
-#[cfg(target_os = "windows")]
-fn push_java_exe(dir: &str, paths: &mut Vec<String>) {
-    let exe = format!("{}\\bin\\java.exe", dir);
-    if std::path::Path::new(&exe).exists() {
-        paths.push(exe);
-    }
-}
+fn deep_scan_recursive(dir: &Path, paths: &mut Vec<String>, depth: u32) {
+    if depth == 0 || !dir.is_dir() { return; }
 
-#[cfg(not(target_os = "windows"))]
-fn push_java_exe(dir: &str, paths: &mut Vec<String>) {
-    let exe = format!("{}/bin/java", dir);
-    if std::path::Path::new(&exe).exists() {
-        paths.push(exe);
-    }
-}
+    let target_name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
 
-/// Scan a directory for java executables, searching subdirs up to `depth` levels
-fn deep_scan_java_dir(dir: &str, paths: &mut Vec<String>, depth: u32) {
-    if depth == 0 {
-        return;
-    }
-    let dir_path = std::path::Path::new(dir);
-    if !dir_path.exists() || !dir_path.is_dir() {
-        return;
-    }
-
-    // Check bin/java.exe directly
-    #[cfg(target_os = "windows")]
-    {
-        let java_exe = dir_path.join("bin").join("java.exe");
-        if java_exe.exists() {
-            paths.push(java_exe.to_string_lossy().to_string());
-        }
-        // Also check if java.exe is directly in this dir
-        let java_direct = dir_path.join("java.exe");
-        if java_direct.exists() {
-            paths.push(java_direct.to_string_lossy().to_string());
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let java_exe = dir_path.join("bin").join("java");
-        if java_exe.exists() {
-            paths.push(java_exe.to_string_lossy().to_string());
-        }
-        // macOS: Contents/Home/bin/java
-        let java_macos = dir_path.join("Contents").join("Home").join("bin").join("java");
-        if java_macos.exists() {
-            paths.push(java_macos.to_string_lossy().to_string());
-        }
-    }
-
-    // Recurse into subdirectories
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                deep_scan_java_dir(
-                    &entry_path.to_string_lossy(),
-                    paths,
-                    depth - 1,
-                );
-            }
-        }
-    }
-}
-
-/// Special recursive scan for game directories - looks for any java.exe
-fn scan_for_java_recursive(dir: &str, paths: &mut Vec<String>, depth: u32) {
-    if depth == 0 {
-        return;
-    }
-    let dir_path = std::path::Path::new(dir);
-    if !dir_path.exists() || !dir_path.is_dir() {
-        return;
-    }
-
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() {
-                let dir_name = entry_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase();
-
-                // Only recurse into directories that might contain Java
-                if dir_name.contains("java")
-                    || dir_name.contains("jdk")
-                    || dir_name.contains("jre")
-                    || dir_name.contains("zulu")
-                    || dir_name.contains("adoptium")
-                    || dir_name.contains("corretto")
-                    || dir_name.contains("graalvm")
-                    || dir_name.contains("azul")
-                    || dir_name.contains("minecraft")
-                    || dir_name.contains("runtime")
-                    || dir_name.contains("bin")
-                {
-                    deep_scan_java_dir(
-                        &entry_path.to_string_lossy(),
-                        paths,
-                        depth - 1,
-                    );
-                    scan_for_java_recursive(
-                        &entry_path.to_string_lossy(),
-                        paths,
-                        depth - 1,
-                    );
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().map_or(false, |n| n == "bin") {
+                    let java_exe = path.join(target_name);
+                    if java_exe.exists() {
+                        paths.push(java_exe.to_string_lossy().into_owned());
+                    }
                 }
+                deep_scan_recursive(&path, paths, depth - 1);
             }
         }
     }
 }
 
 fn check_java(path: &str) -> Option<JavaInfo> {
-    let output = Command::new(path)
-        .arg("-version")
-        .output()
-        .ok()?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let output = Command::new(path).arg("-version").output().ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = if stderr.is_empty() { stdout } else { stderr };
 
-    if combined.is_empty() {
-        return None;
-    }
+    if combined.is_empty() { return None; }
 
-    let version = extract_version(&combined).unwrap_or_else(|| "unknown".to_string());
-    let vendor = extract_vendor(&combined).unwrap_or_else(|| "unknown".to_string());
+    let re = Regex::new(r#"(?i)(?:java|openjdk) version "\s*(?P<version>[^"\s]+)\s*""#).ok()?;
+    let caps = re.captures(&combined)?;
+    let version = caps["version"].to_string();
+
+    let major_version = parse_major_version(&version);
     let is_64bit = combined.contains("64-Bit") || combined.contains("64-bit");
-    let major = parse_major_version(&version);
+    
+    let vendor = if combined.to_lowercase().contains("zulu") {
+        "Zulu".to_string()
+    } else if combined.to_lowercase().contains("openjdk") {
+        "OpenJDK".to_string()
+    } else {
+        "Oracle".to_string()
+    };
 
-    let resolved = resolve_java_path(path).unwrap_or_else(|| path.to_string());
+    let resolved = if path == "java" {
+        resolve_path_from_env(path)?
+    } else {
+        let p = fs::canonicalize(path).ok()?;
+        clean_windows_path(&p)
+    };
 
     Some(JavaInfo {
         path: resolved,
         version,
         vendor,
         is_64bit,
-        major_version: major,
+        major_version,
     })
 }
 
-fn parse_major_version(version: &str) -> u32 {
-    let first_part = version.split('.').next().unwrap_or("0");
-    // Handle "1.8.0_xxx" format
-    let major: u32 = first_part.parse().unwrap_or(0);
-    if major == 1 {
-        // Old format: 1.8.0 -> major is 8
-        version
-            .split('.')
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(major)
+fn clean_windows_path(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with(r"\\?\") {
+        path_str[4..].to_string()
     } else {
-        major
+        path_str.into_owned()
     }
 }
 
-fn extract_version(output: &str) -> Option<String> {
-    for line in output.lines() {
-        if line.contains("version") {
-            if let Some(start) = line.find('"') {
-                if let Some(end) = line[start + 1..].find('"') {
-                    return Some(line[start + 1..start + 1 + end].to_string());
-                }
-            }
+fn parse_major_version(version: &str) -> u32 {
+    let parts: Vec<&str> = version.split('.').collect();
+    let first: u32 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if first == 1 && parts.len() > 1 {
+        parts[1].parse().unwrap_or(first)
+    } else {
+        first
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_javas_from_registry() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut found = Vec::new();
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let keys = vec!["SOFTWARE\\JavaSoft", "SOFTWARE\\WOW6432Node\\JavaSoft"];
+
+    for key_path in keys {
+        if let Ok(root_key) = hklm.open_subkey(key_path) {
+            search_reg_recursive(&root_key, &mut found);
         }
     }
-    None
+    Ok(found)
 }
 
-fn extract_vendor(output: &str) -> Option<String> {
-    let first_line = output.lines().next()?;
-    // e.g. "openjdk version..." or "java version..."
-    let vendor = first_line.split_whitespace().next()?;
-    Some(vendor.to_string())
-}
-
-fn resolve_java_path(path: &str) -> Option<String> {
-    // If it is already an absolute path, just return it
-    let p = std::path::Path::new(path);
-    if p.is_absolute() && p.exists() {
-        return Some(path.to_string());
+#[cfg(target_os = "windows")]
+fn search_reg_recursive(key: &RegKey, results: &mut Vec<String>) {
+    if let Ok(home) = key.get_value::<String, _>("JavaHome") {
+        let p = Path::new(&home).join("bin").join("java.exe");
+        if p.exists() {
+            results.push(p.to_string_lossy().into_owned());
+        }
     }
+    for name in key.enum_keys().flatten() {
+        if let Ok(sub) = key.open_subkey(&name) {
+            search_reg_recursive(&sub, results);
+        }
+    }
+}
 
+fn push_java_exe(dir: &str, paths: &mut Vec<String>) {
+    let bin = Path::new(dir).join("bin").join(if cfg!(target_os = "windows") { "java.exe" } else { "java" });
+    if bin.exists() {
+        paths.push(bin.to_string_lossy().into_owned());
+    }
+}
+
+fn resolve_path_from_env(cmd: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("where").arg(path).output().ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().next().map(|s| s.trim().to_string())
+        let output = Command::new("where").arg(cmd).output().ok()?;
+        String::from_utf8_lossy(&output.stdout).lines().next().map(|s| s.trim().to_string())
     }
-
     #[cfg(not(target_os = "windows"))]
     {
-        let output = Command::new("which").arg(path).output().ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().next().map(|s| s.trim().to_string())
+        let output = Command::new("which").arg(cmd).output().ok()?;
+        String::from_utf8_lossy(&output.stdout).lines().next().map(|s| s.trim().to_string())
     }
-}
-
-pub fn validate_java(path: &str) -> Result<JavaInfo, String> {
-    check_java(path).ok_or_else(|| format!("Invalid Java path: {}", path))
 }
