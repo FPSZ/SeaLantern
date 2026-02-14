@@ -16,19 +16,21 @@
         "title": "Sea Lantern",
         "width": 1200,
         "height": 720,
-		"minWidth": 960,
-		"minHeight": 600,
-		"center": true,
-		"decorations": false,
-		"resizable": true,
-		"transparent": true
+        "minWidth": 960,
+        "minHeight": 600,
+        "center": true,
+        "decorations": false,
+        "resizable": true,
+        "transparent": true
       }
     ],
     "security": {
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },
@@ -47,8 +49,15 @@
         "language": "zh-CN"
       },
       "nsis": {
-        "languages": ["SimpChinese"]
+        "languages": [
+          "SimpChinese"
+        ]
       }
+    },
+    "linux": {
+      "deb": {},
+      "rpm": {},
+      "appimage": {}
     },
     "publisher": "FPS_Z",
     "shortDescription": "Minecraft 服务器管理器",
